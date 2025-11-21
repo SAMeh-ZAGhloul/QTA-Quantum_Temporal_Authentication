@@ -1,167 +1,225 @@
-import numpy as np
+import tkinter as tk
+import numpy as np # <--- NUMPY BACKEND
+import collections
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from collections import deque
-import matplotlib.gridspec as gridspec
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # --- CONFIGURATION ---
-# Physics Parameters
-FRAME_SIZE = 50         # Pulses per animation frame
-WINDOW_SIZE = 200       # Rolling window for graphs
-SAFE_QBER = 0.05        # 5% Max allowed error
-SAFE_TIME_WINDOW = 20   # +/- 20 picoseconds allowed
-BASE_JITTER = 5.0       # Standard deviation of fiber jitter (ps)
+BATCH_SIZE = 5            # Generate 5 photons per frame for speed
+FIBER_DELAY = 0.2         
+ATTACK_DELAY = 0.8        
+WINDOW_TOLERANCE = 0.15   
+GUI_REFRESH_MS = 100      # 10 FPS
+MAX_HISTORY = 100         
 
-# Attack Parameters (Eve)
-EVE_DELAY_MEAN = 40.0   # Eve adds 40ps processing delay
-EVE_DELAY_JITTER = 10.0 # Eve adds extra noise
-INTERCEPT_RESEND_ERROR = 0.25 # Theoretical error rate for BB84 intercept-resend
-
-class QTASimulator:
+class QTA_Numpy_Engine:
     def __init__(self):
-        # State
-        self.is_eve_active = False
-        self.frame_count = 0
-        
-        # Data Buffers for Plotting
-        self.qber_history = deque([0] * WINDOW_SIZE, maxlen=WINDOW_SIZE)
-        self.toa_history = deque([], maxlen=1000) # Keep last 1000 photon arrivals
-        self.score_history = deque([1.0] * WINDOW_SIZE, maxlen=WINDOW_SIZE)
-        
-    def toggle_eve(self, event):
-        """Event handler to toggle attack mode."""
-        if event.key == 'e':
-            self.is_eve_active = not self.is_eve_active
-            state = "ACTIVE" if self.is_eve_active else "INACTIVE"
-            print(f"[SIM] Eve is now {state}")
+        self.eve_active = False
+        self.total_sent = 0
+        self.total_detected = 0
+        self.total_errors = 0
 
-    def run_physics_step(self):
-        """Simulates one frame of photon transmission."""
-        # 1. Alice prepares states (0=Rectilinear, 1=Diagonal)
-        alice_bases = np.random.randint(0, 2, FRAME_SIZE)
-        alice_bits = np.random.randint(0, 2, FRAME_SIZE)
+    def next_batch(self):
+        """
+        Generates a batch of photon events using Vectorized Math.
+        Returns a list of dicts: {'idx', 'offset', 'error', 'attacked'}
+        """
+        # 1. Alice Generates
+        alice_bits = np.random.randint(0, 2, BATCH_SIZE)
+        alice_bases = np.random.randint(0, 2, BATCH_SIZE)
         
-        # 2. Transmission Channel
-        # Base timing is 0 (perfect sync) + Jitter
-        toa = np.random.normal(0, BASE_JITTER, FRAME_SIZE)
-        bob_bases = np.random.randint(0, 2, FRAME_SIZE) # Bob chooses random bases
-        bob_bits = alice_bits.copy() # Start with perfect copy
+        # 2. Channel Physics (Time of Arrival)
+        # Base noise
+        noise = np.random.normal(0, 0.01, BATCH_SIZE)
+        offsets = np.full(BATCH_SIZE, FIBER_DELAY) + noise
         
-        # 3. EVE INTERVENTION
-        if self.is_eve_active:
-            # Eve chooses random bases to measure
-            eve_bases = np.random.randint(0, 2, FRAME_SIZE)
+        is_attacked = np.full(BATCH_SIZE, False)
+        
+        # 3. Eve Logic (Vectorized)
+        if self.eve_active:
+            # Add Delay
+            offsets += ATTACK_DELAY
+            is_attacked[:] = True
             
-            # Logic: If Eve picks wrong basis, she randomizes the bit
-            # Mask where Eve matches Alice (No error introduced to bit yet)
-            eve_mismatch = (eve_bases != alice_bases)
-            
-            # Where mismatch, Eve sends random bit (50% chance of flipping Alice's bit)
-            # This results in ~25% total QBER on Bob's side
-            noise = np.random.randint(0, 2, FRAME_SIZE)
-            bob_bits[eve_mismatch] = noise[eve_mismatch]
-            
-            # Eve adds Delay (Time of Flight / Processing)
-            delay = np.random.normal(EVE_DELAY_MEAN, EVE_DELAY_JITTER, FRAME_SIZE)
-            toa += delay
+            # Intercept-Resend (Probability Math)
+            # Eve guesses basis. If wrong (50%), she randomizes bit.
+            eve_bases = np.random.randint(0, 2, BATCH_SIZE)
+            # Mask where Eve chose wrong basis
+            basis_mismatch = (eve_bases != alice_bases)
+            # Randomize bits where basis was wrong
+            alice_bits[basis_mismatch] = np.random.randint(0, 2, np.sum(basis_mismatch))
 
         # 4. Bob Measures
-        # We only keep data where Alice and Bob bases matched (Sifting)
-        sift_mask = (alice_bases == bob_bases)
-        valid_indices = np.where(sift_mask)[0]
+        bob_bases = np.random.randint(0, 2, BATCH_SIZE)
         
-        if len(valid_indices) == 0:
-            return 0, []
+        # 5. Sifting & Error Checking
+        results = []
+        for i in range(BATCH_SIZE):
+            self.total_sent += 1
+            
+            # Sift: Did Bob guess the right basis?
+            if bob_bases[i] == alice_bases[i]:
+                self.total_detected += 1
+                
+                # Check Bit Error
+                # (In simulation, we compare modified alice_bits vs original, 
+                # but here we just assume Bob measured alice_bits directly if basis matched)
+                # Note: In real physics, Bob measures the photon state. 
+                # Here, alice_bits already holds the state 'as it arrived'.
+                
+                # If Eve randomized it, it might be wrong.
+                # We need original bits to compare? 
+                # Simplified: Assume alice_bits IS the measured result.
+                # Wait, we need to know if it CHANGED from original.
+                # Let's refine:
+                
+                # Re-roll logic for clarity:
+                # If Eve messed it up, there is 50% chance of error IF Bob measures correct basis.
+                # Actually, the vector logic above modified alice_bits in place. 
+                # We need the original intent. 
+                # For simulation visuals, we can just assume "Error" if bit flip happened.
+                # But we lost the original bit. Let's just simplify:
+                
+                is_error = False
+                if self.eve_active and (eve_bases[i] != alice_bases[i]):
+                     # Eve used wrong basis -> Result is random
+                     # 50% chance it differs from what Alice intended
+                     if np.random.random() < 0.5:
+                         is_error = True
+                
+                if is_error:
+                    self.total_errors += 1
 
-        # Calculate Errors (QBER)
-        # Compare Alice's sent bits vs Bob's measured bits (after Eve potentially messed them up)
-        errors = np.sum(alice_bits[valid_indices] != bob_bits[valid_indices])
-        total_sifted = len(valid_indices)
-        current_qber = errors / total_sifted if total_sifted > 0 else 0
-        
-        # Calculate Timing Compliance
-        # Count how many photons arrived within the strict time window
-        # Using absolute value of ToA
-        timing_compliant = np.sum(np.abs(toa[valid_indices]) <= SAFE_TIME_WINDOW)
-        timing_score = timing_compliant / total_sifted if total_sifted > 0 else 0
+                # Recenter offset for graph (so 0.0 is perfect arrival)
+                # (The offsets array has FIBER_DELAY added, we want deviation)
+                display_offset = offsets[i] - FIBER_DELAY
 
-        # Auth Decision (Requires Low QBER AND Good Timing)
-        is_auth_success = (current_qber < SAFE_QBER) and (timing_score > 0.90)
-        
-        return current_qber, toa[valid_indices], 1.0 if is_auth_success else 0.0
+                results.append({
+                    "idx": self.total_detected,
+                    "offset": display_offset,
+                    "error": is_error,
+                    "attacked": is_attacked[i]
+                })
+                
+        return results
 
-    def update(self, frame):
-        """Animation Loop"""
-        qber, toas, score = self.run_physics_step()
+class QTA_Dashboard:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("QTA Protocol (NumPy Backend)")
+        self.root.geometry("1100x750")
         
-        # Update Buffers
-        self.qber_history.append(qber)
-        self.toa_history.extend(toas)
-        self.score_history.append(score)
+        self.root.bind('<space>', self.toggle_eve)
         
-        # --- UPDATE PLOTS ---
+        # --- BACKEND SWAP ---
+        self.engine = QTA_Numpy_Engine()
+        # --------------------
+
+        self.master_buffer = collections.deque(maxlen=MAX_HISTORY)
+        self._build_gui()
+        self.run_update_loop()
+
+    def _build_gui(self):
+        panel = tk.Frame(self.root, bg="#1a1a1a", width=250)
+        panel.pack(side=tk.LEFT, fill=tk.Y)
         
-        # 1. QBER Line
-        line_qber.set_data(range(WINDOW_SIZE), self.qber_history)
-        if self.is_eve_active:
-            ax1.set_title(f"QBER Monitor (ATTACK DETECTED) | Current: {qber:.2%}", color='red', weight='bold')
+        tk.Label(panel, text="QUANTUM\nSECURITY", fg="#00d4ff", bg="#1a1a1a", font=("Impact", 20)).pack(pady=30)
+        
+        self.lbl_status = tk.Label(panel, text="LINK SECURE", fg="#00ff00", bg="black", 
+                                   font=("Consolas", 14, "bold"), width=15, pady=10, relief="sunken")
+        self.lbl_status.pack(pady=10)
+
+        self.btn = tk.Button(panel, text="ACTIVATE EVE\n(Spacebar)", highlightbackground="#444", 
+                             font=("Arial", 12, "bold"), height=3, command=self.toggle_eve_event)
+        self.btn.pack(pady=20, padx=15, fill=tk.X)
+        
+        self.lbl_stats = tk.Label(panel, text="--", fg="#888", bg="#1a1a1a", justify=tk.LEFT, font=("Consolas", 10))
+        self.lbl_stats.pack(pady=20)
+
+        self.fig = plt.Figure(figsize=(8, 8), dpi=100, facecolor="#f0f0f0")
+        gs = self.fig.add_gridspec(2, 1)
+        
+        self.ax1 = self.fig.add_subplot(gs[0])
+        self.ax1.set_title("Photon Time-of-Arrival (NumPy)")
+        self.ax1.set_ylabel("Offset (ns)")
+        self.ax1.set_ylim(-0.5, 1.5) 
+        self.ax1.axhspan(-WINDOW_TOLERANCE, WINDOW_TOLERANCE, color="green", alpha=0.15)
+        self.plot_safe, = self.ax1.plot([], [], 'o', color="green", markersize=5, alpha=0.7)
+        self.plot_attack, = self.ax1.plot([], [], 'o', color="red", markersize=5, alpha=0.8)
+        self.ax1.grid(True, alpha=0.3)
+
+        self.ax2 = self.fig.add_subplot(gs[1])
+        self.ax2.set_title("QBER (Bit Error Rate)")
+        self.ax2.set_ylabel("Error %")
+        self.ax2.set_ylim(0, 0.6)
+        self.ax2.axhline(0.05, color="red", linestyle="--")
+        self.plot_qber, = self.ax2.plot([], [], color="#333", lw=2)
+        self.ax2.grid(True, alpha=0.3)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+    def toggle_eve_event(self): self.toggle_eve(None)
+
+    def toggle_eve(self, event=None):
+        self.engine.eve_active = not self.engine.eve_active
+        if self.engine.eve_active:
+            self.lbl_status.config(text="INTERCEPTED", fg="red")
+            self.btn.config(text="DEACTIVATE EVE")
         else:
-            ax1.set_title(f"QBER Monitor (Secure) | Current: {qber:.2%}", color='green')
+            self.lbl_status.config(text="LINK SECURE", fg="#00ff00")
+            self.btn.config(text="ACTIVATE EVE")
 
-        # 2. Timing Histogram
-        ax2.cla()
-        ax2.set_title("Time-of-Arrival (ToA) Distribution")
-        ax2.set_xlabel("Offset (ps)")
-        ax2.set_ylabel("Count")
-        ax2.set_xlim(-100, 150) # View range
+    def run_update_loop(self):
+        self.root.update_idletasks()
+
+        # --- GET DATA FROM NUMPY ---
+        batch_data = self.engine.next_batch()
         
-        # Draw Safety Window
-        ax2.axvspan(-SAFE_TIME_WINDOW, SAFE_TIME_WINDOW, color='green', alpha=0.2, label="Valid Window")
-        
-        # Draw Histogram
-        if len(self.toa_history) > 0:
-            n, bins, patches = ax2.hist(self.toa_history, bins=30, color='blue', alpha=0.7)
+        for d in batch_data:
+            err_val = 1.0 if d["error"] else 0.0
+            self.master_buffer.append({
+                "x": d["idx"],
+                "y_time": d["offset"],
+                "attack": d["attacked"],
+                "err": err_val
+            })
+
+        if len(self.master_buffer) > 1:
+            # Rebuild Plot Arrays
+            xs_safe = [p["x"] for p in self.master_buffer if not p["attack"]]
+            ys_safe = [p["y_time"] for p in self.master_buffer if not p["attack"]]
+            xs_att = [p["x"] for p in self.master_buffer if p["attack"]]
+            ys_att = [p["y_time"] for p in self.master_buffer if p["attack"]]
             
-            # Highlight delayed photons in red
-            # This is a visual trick: usually hard to change color of hist bars individually in efficient loops
-            # but useful for static analysis. Here we stick to blue for speed.
+            self.plot_safe.set_data(xs_safe, ys_safe)
+            self.plot_attack.set_data(xs_att, ys_att)
             
-        # 3. Auth Score
-        ax3.cla()
-        ax3.set_title("Authentication Health")
-        ax3.set_ylim(-0.1, 1.1)
-        ax3.plot(self.score_history, color='purple', lw=2)
-        ax3.fill_between(range(WINDOW_SIZE), self.score_history, color='purple', alpha=0.3)
-        ax3.text(5, 0.1, "Press 'E' to toggle Eve Attack", fontsize=8, style='italic')
+            last_x = self.master_buffer[-1]["x"]
+            self.ax1.set_xlim(max(0, last_x - MAX_HISTORY), last_x + 10)
 
-        return line_qber,
+            # QBER Rolling Avg
+            qber_x = []
+            qber_y = []
+            recent_errs = collections.deque(maxlen=20) 
+            for p in self.master_buffer:
+                recent_errs.append(p["err"])
+                avg = sum(recent_errs) / len(recent_errs)
+                qber_x.append(p["x"])
+                qber_y.append(avg)
+            
+            self.plot_qber.set_data(qber_x, qber_y)
+            self.ax2.set_xlim(max(0, last_x - MAX_HISTORY), last_x + 10)
+            
+            self.canvas.draw_idle()
 
-# --- SETUP PLOT ---
-sim = QTASimulator()
+            ratio = self.engine.total_errors/self.engine.total_detected if self.engine.total_detected > 0 else 0
+            self.lbl_stats.config(text=f"PHOTONS: {self.engine.total_sent}\nDETECTED: {self.engine.total_detected}\nAVG QBER: {ratio:.1%}")
 
-fig = plt.figure(figsize=(12, 8))
-fig.canvas.mpl_connect('key_press_event', sim.toggle_eve)
-gs = gridspec.GridSpec(2, 2, height_ratios=[1, 1])
+        self.root.after(GUI_REFRESH_MS, self.run_update_loop)
 
-# Top: QBER (Spans width)
-ax1 = plt.subplot(gs[0, :])
-ax1.set_ylim(0, 0.5)
-ax1.set_ylabel("Error Rate")
-ax1.axhline(y=SAFE_QBER, color='r', linestyle='--', label="Max Threshold")
-line_qber, = ax1.plot([], [], lw=2)
-ax1.legend(loc="upper right")
-
-# Bottom Left: ToA
-ax2 = plt.subplot(gs[1, 0])
-
-# Bottom Right: Score
-ax3 = plt.subplot(gs[1, 1])
-
-plt.tight_layout()
-ani = FuncAnimation(fig, sim.update, interval=50, blit=False)
-
-print("--- QTA SIMULATION STARTED ---")
-print("1. Watch the Green Window (Valid Timing)")
-print("2. Watch the QBER (Should be < 5%)")
-print("3. PRESS 'e' TO LAUNCH INTERCEPT ATTACK")
-plt.show()
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = QTA_Dashboard(root)
+    root.mainloop()
+    
