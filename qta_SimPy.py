@@ -1,3 +1,9 @@
+"""
+Quantum Temporal Authentication (QTA) Simulator
+GUI implementation with real-time visualization
+Discrete-event simulation using SimPy
+"""
+
 import tkinter as tk
 import simpy
 import random

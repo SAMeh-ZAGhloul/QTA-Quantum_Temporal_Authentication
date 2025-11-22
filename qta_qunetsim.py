@@ -1,9 +1,7 @@
-# qta_qunetim_gui.py
 """
 Quantum Temporal Authentication (QTA) Simulator
-Professional GUI implementation with real-time visualization
-Simplified quantum simulation (no QuNetSim required)
-FIXED: Eve checkbox now properly controls Eve's attack
+GUI implementation with real-time visualization
+Simplified quantum simulation (simulated QuNetSim functionality)
 """
 
 import sys

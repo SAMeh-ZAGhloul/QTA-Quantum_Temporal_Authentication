@@ -1,4 +1,9 @@
-# qta_dash_app.py (REFactored VERSION USING QISKIT EXECUTE)
+"""
+Quantum Temporal Authentication (QTA) Simulator
+GUI implementation with real-time visualization
+Qiskit backend for quantum circuit simulation
+"""
+
 import dash
 from dash import dcc, html, Input, Output, State, callback_context
 import plotly.graph_objs as go

@@ -1,3 +1,9 @@
+"""
+Quantum Temporal Authentication (QTA) Simulator
+GUI implementation with real-time visualization
+NumPy backend for fast vectorized simulation
+"""
+
 import tkinter as tk
 import numpy as np # <--- NUMPY BACKEND
 import collections

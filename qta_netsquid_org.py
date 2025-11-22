@@ -1,7 +1,7 @@
-# hybrid_qta_architecture.py
 """
-Production-Grade QTA Simulator
-Combines best features from multiple frameworks
+Quantum Temporal Authentication (QTA) Simulator
+GUI implementation with real-time visualization
+Network Simulator using NetSquid (discrete-event simulation)
 """
 
 # Layer 1: Quantum simulation - NetSquid for realism
