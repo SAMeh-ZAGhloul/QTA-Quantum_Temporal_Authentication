@@ -53,6 +53,15 @@ class Pulse:
     measurement_basis: Optional[Basis] = None
     measurement_result: Optional[int] = None
 
+class TrafficEvent:
+    """Represents a traffic event in the QTA protocol"""
+    def __init__(self, sender, receiver, event_type, timestamp=None, details=None):
+        self.sender = sender
+        self.receiver = receiver
+        self.event_type = event_type  # 'quantum', 'classical', 'intercept'
+        self.timestamp = timestamp if timestamp else time.time()
+        self.details = details if details else {}
+
 class QuantumChannel:
     """Simulates a quantum communication channel with potential eavesdropping"""
     
@@ -60,10 +69,20 @@ class QuantumChannel:
         self.loss_prob = loss_prob
         self.eve_active = False
         self.eve_intercept_prob = 0.3  # Probability Eve attempts to intercept
+        self.traffic_log = []  # Log of traffic events
+        self.buffer = queue.Queue()  # Buffer for transmitted pulses
         
-    def transmit(self, pulses: List[Pulse], eve=None) -> List[Pulse]:
+    def transmit(self, pulses: List[Pulse], eve=None, sender="Alice", receiver="Bob") -> List[Pulse]:
         """Transmit pulses through the quantum channel, with potential eavesdropping"""
         received_pulses = []
+        
+        # Log transmission event
+        self.traffic_log.append(TrafficEvent(
+            sender=sender,
+            receiver=receiver,
+            event_type='quantum',
+            details={'pulse_count': len(pulses)}
+        ))
         
         for pulse in pulses:
             # Simulate photon loss
@@ -72,9 +91,41 @@ class QuantumChannel:
                 
             # Eve's interception attempt
             if self.eve_active and eve and random.random() < self.eve_intercept_prob:
+                # Log interception
+                self.traffic_log.append(TrafficEvent(
+                    sender="Eve",
+                    receiver=receiver,
+                    event_type='intercept',
+                    details={'original_sender': sender}
+                ))
                 pulse = eve.intercept(pulse)
                 
             received_pulses.append(pulse)
+            
+        # Store in buffer for receiver to retrieve
+        self.buffer.put({
+            'receiver': receiver,
+            'pulses': received_pulses
+        })
+            
+        return received_pulses
+        
+    def receive(self, receiver):
+        """Receive pulses intended for the specified receiver"""
+        received_pulses = []
+        temp_items = []
+        
+        # Get all items from buffer
+        while not self.buffer.empty():
+            item = self.buffer.get()
+            if item['receiver'] == receiver:
+                received_pulses.extend(item['pulses'])
+            else:
+                temp_items.append(item)
+                
+        # Put back items not intended for this receiver
+        for item in temp_items:
+            self.buffer.put(item)
             
         return received_pulses
 
@@ -83,6 +134,7 @@ class ClassicalChannel:
     
     def __init__(self):
         self.messages = queue.Queue()
+        self.traffic_log = []  # Log of traffic events
         
     def send(self, sender, receiver, message):
         """Send a message from sender to receiver"""
@@ -93,6 +145,15 @@ class ClassicalChannel:
             'message': message,
             'timestamp': timestamp
         })
+        
+        # Log transmission event
+        self.traffic_log.append(TrafficEvent(
+            sender=sender,
+            receiver=receiver,
+            event_type='classical',
+            timestamp=timestamp,
+            details={'message_type': message.get('type', 'unknown')}
+        ))
         
     def receive(self, receiver):
         """Receive messages intended for the specified receiver"""
@@ -115,9 +176,10 @@ class ClassicalChannel:
 class Alice:
     """Server in the QTA protocol"""
     
-    def __init__(self, classical_channel, quantum_channel):
+    def __init__(self, classical_channel, quantum_channel, eve):
         self.classical_channel = classical_channel
         self.quantum_channel = quantum_channel
+        self.eve = eve # Keep a reference to Eve
         self.frame_id = 0
         self.nonce = None
         self.current_frame = []
@@ -154,7 +216,8 @@ class Alice:
     def send_challenge(self):
         """Send quantum challenge to Bob"""
         pulses, nonce = self.create_quantum_challenge()
-        self.quantum_channel.transmit(pulses)
+        # FIX: Pass the eve object to the transmit method
+        self.quantum_channel.transmit(pulses, eve=self.eve, sender="Alice", receiver="Bob")
         
         # Send classical message with nonce
         self.classical_channel.send(
@@ -234,8 +297,8 @@ class Bob:
         
     def receive_quantum_states(self):
         """Receive quantum states from Alice"""
-        # Simulate receiving quantum states
-        received_pulses = self.quantum_channel.transmit([], self)  # Empty list to indicate reception
+        # Receive quantum states from the channel
+        received_pulses = self.quantum_channel.receive("Bob")
         
         self.measurements = []
         for pulse in received_pulses:
@@ -336,19 +399,23 @@ class QTASimulator:
         self.quantum_channel = QuantumChannel()
         
         # Create parties
-        self.alice = Alice(self.classical_channel, self.quantum_channel)
-        self.bob = Bob(self.classical_channel, self.quantum_channel)
         self.eve = Eve(self.quantum_channel)
+        self.alice = Alice(self.classical_channel, self.quantum_channel, self.eve)
+        self.bob = Bob(self.classical_channel, self.quantum_channel)
         
         # Visualization setup
-        self.fig, self.axes = plt.subplots(2, 2, figsize=(12, 10))
+        self.fig = plt.figure(figsize=(14, 10))
         self.fig.suptitle('Quantum Temporal Authentication (QTA) Simulator', fontsize=16)
         
+        # Create grid for subplots
+        gs = self.fig.add_gridspec(3, 2, height_ratios=[1, 1, 1], width_ratios=[1, 1])
+        
         # Setup axes
-        self.qber_ax = self.axes[0, 0]
-        self.success_ax = self.axes[0, 1]
-        self.quantum_ax = self.axes[1, 0]
-        self.status_ax = self.axes[1, 1]
+        self.qber_ax = self.fig.add_subplot(gs[0, 0])
+        self.success_ax = self.fig.add_subplot(gs[0, 1])
+        self.traffic_ax = self.fig.add_subplot(gs[1, :])
+        self.quantum_ax = self.fig.add_subplot(gs[2, 0])
+        self.status_ax = self.fig.add_subplot(gs[2, 1])
         
         # Initialize plots
         self.qber_line, = self.qber_ax.plot([], [], 'r-', label='QBER')
@@ -368,6 +435,7 @@ class QTASimulator:
         self.success_ax.axhline(y=MIN_SUCCESS_RATE, color='g', linestyle='--', label='Threshold')
         self.success_ax.legend()
         
+        # Quantum state visualization
         self.quantum_ax.set_title('Quantum State Visualization')
         self.quantum_ax.set_xlabel('Pulse Index')
         self.quantum_ax.set_ylabel('Basis/Value')
@@ -430,6 +498,9 @@ class QTASimulator:
             x = list(range(len(self.alice.history['success_rate'])))
             self.success_line.set_data(x, list(self.alice.history['success_rate']))
             
+        # Update traffic visualization
+        self.update_traffic_visualization()
+        
         # Update quantum state visualization
         self.quantum_ax.clear()
         self.quantum_ax.set_title('Quantum State Visualization')
@@ -474,6 +545,70 @@ class QTASimulator:
         
         return self.qber_line, self.success_line
         
+    def update_traffic_visualization(self):
+        """Update the traffic flow visualization"""
+        # Clear the entire axis for a fresh redraw
+        self.traffic_ax.cla()
+
+        # Reset axis properties
+        self.traffic_ax.set_title('Traffic Flow Visualization')
+        self.traffic_ax.set_xlim(0, 10)
+        self.traffic_ax.set_ylim(0, 6) # Adjusted y-limits slightly
+        self.traffic_ax.set_xlabel('Time (last 10s)')
+        self.traffic_ax.set_yticks([1, 3, 5])
+        self.traffic_ax.set_yticklabels(['Alice', 'Bob', 'Eve'])
+        self.traffic_ax.grid(True, linestyle='--', alpha=0.7)
+
+        # Get current time
+        current_time = time.time()
+
+        # Get all traffic events from channels
+        all_events = []
+        all_events.extend(self.quantum_channel.traffic_log)
+        all_events.extend(self.classical_channel.traffic_log)
+
+        # Filter events to show only recent ones (last 10 seconds)
+        recent_events = [e for e in all_events if current_time - e.timestamp <= 10]
+
+        if not recent_events:
+            return # Nothing to plot
+
+        # Normalize timestamps to fit in the plot
+        min_time = min(e.timestamp for e in recent_events)
+        max_time = max(e.timestamp for e in recent_events)
+        time_range = max_time - min_time if max_time > min_time else 1
+
+        # Plot events
+        for event in recent_events:
+            # Normalize time to [0, 10] range
+            norm_time = (event.timestamp - min_time) / time_range * 10
+
+            # Determine y-position based on sender
+            y_pos_map = {"Alice": 1, "Bob": 3, "Eve": 5}
+            y_pos = y_pos_map.get(event.sender)
+            if y_pos is None:
+                continue
+
+            # Determine color and marker based on event type
+            style_map = {
+                'quantum': {'color': 'blue', 'marker': 'o'},
+                'classical': {'color': 'green', 'marker': 's'},
+                'intercept': {'color': 'red', 'marker': 'x'}
+            }
+            style = style_map.get(event.event_type)
+            if style is None:
+                continue
+
+            # Plot the event
+            self.traffic_ax.scatter(norm_time, y_pos, color=style['color'], marker=style['marker'], s=100, alpha=0.7)
+
+            # Add arrow to show direction
+            end_y_pos = y_pos_map.get(event.receiver)
+            if end_y_pos is not None and event.event_type != 'intercept' and y_pos != end_y_pos:
+                self.traffic_ax.arrow(norm_time, y_pos, 0, end_y_pos - y_pos,
+                                     head_width=0.2, head_length=0.3,
+                                     fc=style['color'], ec=style['color'], alpha=0.5)
+
     def run_frame(self):
         """Run one frame of the QTA protocol"""
         # Alice sends challenge
@@ -510,5 +645,4 @@ class QTASimulator:
 if __name__ == "__main__":
     simulator = QTASimulator()
     simulator.run()
-
     
