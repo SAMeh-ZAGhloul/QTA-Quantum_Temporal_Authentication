@@ -1,385 +1,922 @@
+# qta_qunetim_gui.py
+"""
+Quantum Temporal Authentication (QTA) Simulator
+Professional GUI implementation with real-time visualization
+Simplified quantum simulation (no QuNetSim required)
+FIXED: Eve checkbox now properly controls Eve's attack
+"""
+
+import sys
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import tkinter as tk
-from tkinter import ttk, messagebox
+from threading import Thread, Lock
 import time
-import threading
-import queue
 from collections import deque
-import random
-import hashlib
-import hmac
-import json
+from datetime import datetime
 
-# Constants for QTA protocol
-PULSES_PER_FRAME = 1024
-FRAME_DURATION_MS = 1
-TIMING_WINDOW_PS = 50  # Timing window in picoseconds
-QBER_THRESHOLD = 0.05  # 5% QBER threshold
-MIN_SUCCESS_RATE = 0.95  # Minimum success rate for authentication
-PHOTON_LOSS_PROB = 0.2  # Probability of photon loss in the channel
+# PyQt5 for GUI
+try:
+    from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                                  QHBoxLayout, QPushButton, QLabel, QGroupBox, 
+                                  QTextEdit, QSpinBox, QDoubleSpinBox, QCheckBox,
+                                  QGridLayout, QTabWidget, QProgressBar)
+    from PyQt5.QtCore import QTimer, pyqtSignal, QObject, Qt
+    from PyQt5.QtGui import QFont, QPalette, QColor
+except ImportError:
+    print("Error: PyQt5 not installed. Install with: pip install PyQt5")
+    sys.exit(1)
 
-# Use stable SimPy-inspired engine for simulation, avoiding QuNetSim threading issues
+# Matplotlib for embedded plots
+import matplotlib
+matplotlib.use('Qt5Agg')
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
-# --- QTA SIMULATION ENGINE (Using SimPy Logic for Stability) ---
 
-class QTA_Simulated_Engine:
-    """
-    A stable, simplified engine that mimics the QTA protocol using local
-    randomization and time simulation, avoiding QuNetSim's threading conflicts.
-    """
+# ==================== Configuration ====================
+
+class QTAConfig:
+    """Configuration for QTA simulation"""
     def __init__(self):
-        # We don't start the full QuNetSim network, just the simulation state
-        print(">>> Starting Hybrid SimPy/QuNetSim Simulation Engine.")
-        self.eve_active = False
-        self.total_sent = 0
-        self.total_detected = 0
-        self.total_errors = 0
-
-    def run_protocol_step(self, batch_size=PULSES_PER_FRAME):
-        results = []
-
-        for _ in range(batch_size):
-            self.total_sent += 1
-
-            # 1. Alice Prepares
-            original_bit = np.random.randint(0, 2)
-            basis = np.random.randint(0, 2)  # Alice's basis (0=Z, 1=X)
-
-            offset = np.random.normal(0, 0.02)  # Base timing offset (natural jitter)
-            is_attacked = False
-            is_error = False
-
-            # 2. Eve's Action
-            if self.eve_active:
-                is_attacked = True
-                offset += 0.8  # Add the large, easily detected QTA offset
-
-                # Eve's intercept-resend attack:
-                eve_basis = np.random.randint(0, 2)
-
-                # Check for QBER: An error (bit flip) occurs if Alice and Eve
-                # chose different bases, which is 50% of the time.
-                if eve_basis != basis:
-                    # In this 50% case, the qubit state collapses randomly.
-                    # Bob will measure incorrectly 50% of the time,
-                    # leading to an overall 25% error rate (QBER).
-                    if np.random.rand() < 0.5:
-                        is_error = True
-
-            # 3. Bob Measures (Simulated)
-            bob_basis = np.random.randint(0, 2)
-
-            # 4. Sift & Error Check
-            if bob_basis == basis:
-                # Bases match, this is a sifting success event
-                self.total_detected += 1
-
-                # Check if an error was caused by Eve's previous action,
-                # or if a natural/external error occurred (small chance)
-                if not is_attacked:
-                    # Small natural quantum error rate (simulated dark counts/loss)
-                    if np.random.rand() < 0.01:
-                        is_error = True
-
-                if is_error:
-                    self.total_errors += 1
-
-                results.append({
-                    "idx": self.total_detected,
-                    "offset": offset,
-                    "error": is_error,
-                    "attacked": is_attacked
-                })
-
-        return results
-
-    def stop(self):
-        # No network to stop
-        print(">>> Hybrid Engine Stopped.")
-        pass
-
-class QTASimulator:
-    """Main QTA simulator using QuNetSim with GUI"""
-    
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Quantum Temporal Authentication (QTA) Simulator")
-        self.root.geometry("1200x800")
-
-        # Use the stable SimPy-inspired engine
-        self.engine = QTA_Simulated_Engine()
-
         # Simulation parameters
-        self.running = False
-        self.frame_count = 0
-        self.authenticated = False
+        self.num_frames = 100
+        self.qubits_per_frame = 20
+        self.frame_interval_ms = 100  # Time between frames
+        
+        # Timing parameters (in milliseconds for simulation)
+        self.timing_window_ms = 10.0
+        self.expected_delay_ms = 5.0
+        
+        # Security parameters
+        self.qber_threshold = 0.11  # 11% is typical BB84 threshold
+        self.min_detection_rate = 0.3  # At least 30% qubits detected
+        
+        # Eve parameters
+        self.eve_active = True
+        self.eve_intercept_prob = 0.3
+        self.eve_delay_ms = 15.0  # Eve causes detectable delay
+        
+        # Channel parameters
+        self.channel_loss_prob = 0.2
+        self.detector_efficiency = 0.85
+        self.measurement_error_rate = 0.01
+        
+        # Basis choices (computational and Hadamard)
+        self.bases = ['Z', 'X']
 
-        # Data storage for visualization
-        self.master_buffer = deque(maxlen=100)
 
-        # Setup GUI
-        self.setup_gui()
-        
-    def setup_gui(self):
-        """Setup the GUI components"""
-        # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Control panel
-        control_frame = ttk.LabelFrame(main_frame, text="Simulation Controls", padding="10")
-        control_frame.pack(side=tk.TOP, fill=tk.X, pady=5)
-        
-        # Start/Stop button
-        self.start_button = ttk.Button(control_frame, text="Start Simulation", command=self.toggle_simulation)
-        self.start_button.pack(side=tk.LEFT, padx=5)
-        
-        # Reset button
-        reset_button = ttk.Button(control_frame, text="Reset", command=self.reset_simulation)
-        reset_button.pack(side=tk.LEFT, padx=5)
-        
-        # Eve active checkbox
-        self.eve_var = tk.BooleanVar()
-        eve_checkbox = ttk.Checkbutton(control_frame, text="Eve Active", variable=self.eve_var, command=self.toggle_eve)
-        eve_checkbox.pack(side=tk.LEFT, padx=5)
-        
-        # Status label
-        self.status_var = tk.StringVar(value="Status: Ready")
-        status_label = ttk.Label(control_frame, textvariable=self.status_var)
-        status_label.pack(side=tk.RIGHT, padx=5)
-        
-        # Visualization frame
-        viz_frame = ttk.LabelFrame(main_frame, text="Real-time Visualization", padding="10")
-        viz_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # Create matplotlib figure for visualization
-        self.fig, self.axes = plt.subplots(2, 2, figsize=(10, 6))
-        self.fig.tight_layout(pad=3.0)
+# ==================== Simplified Qubit Class ====================
 
-        # Photon time-of-arrival plot
-        self.timing_ax = self.axes[0, 0]
-        self.timing_ax.set_title("Photon Time-of-Arrival (QTA)")
-        self.timing_ax.set_xlabel("Frame")
-        self.timing_ax.set_ylabel("Offset (ns)")
-        self.timing_ax.set_ylim(-0.5, 1.5)
-        self.timing_ax.axhspan(-0.15, 0.15, color="green", alpha=0.15)  # Window tolerance
-        self.plot_safe, = self.timing_ax.plot([], [], 'o', color="green", markersize=5, alpha=0.7)
-        self.plot_attack, = self.timing_ax.plot([], [], 'o', color="red", markersize=5, alpha=0.8)
-        self.timing_ax.grid(True, alpha=0.3)
-
-        # QBER plot
-        self.qber_ax = self.axes[0, 1]
-        self.qber_ax.set_title("QBER (Bit Error Rate)")
-        self.qber_ax.set_xlabel("Frame")
-        self.qber_ax.set_ylabel("Error %")
-        self.qber_ax.set_ylim(0, 0.6)
-        self.qber_ax.axhline(y=QBER_THRESHOLD, color='red', linestyle='--')
-        self.qber_line, = self.qber_ax.plot([], [], color="#333", lw=2)
-        self.qber_ax.grid(True, alpha=0.3)
-
-        # Quantum state visualization
-        self.quantum_ax = self.axes[1, 0]
-        self.quantum_ax.set_title("Quantum State Visualization")
-        self.quantum_ax.set_xlabel("Pulse Index")
-        self.quantum_ax.set_ylabel("Basis/Value")
-
-        # Authentication status
-        self.auth_ax = self.axes[1, 1]
-        self.auth_ax.set_title("Authentication Status")
-        self.auth_ax.axis('off')
-        
-        # Embed matplotlib figure in tkinter
-        self.canvas = FigureCanvasTkAgg(self.fig, master=viz_frame)
-        self.canvas.draw()
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        # Info panel
-        info_frame = ttk.LabelFrame(main_frame, text="Protocol Information", padding="10")
-        info_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
-        
-        # Protocol info text
-        info_text = """Quantum Temporal Authentication (QTA) Protocol:
-        
-1. Alice (Server) generates a quantum challenge with random states and timestamps.
-2. Bob (Client) measures the quantum states and records detection times.
-3. Bob sends measurement results back to Alice over a classical channel.
-4. Alice verifies the measurements based on expected values and timing constraints.
-5. Authentication is successful if QBER is below threshold and timing constraints are met.
-
-Eve (Eavesdropper) can attempt to intercept and measure quantum states,
-which introduces errors that increase the QBER and can be detected."""
-        
-        info_label = ttk.Label(info_frame, text=info_text, justify=tk.LEFT)
-        info_label.pack(side=tk.LEFT, padx=5)
-        
-    def toggle_simulation(self):
-        """Start or stop the simulation"""
-        if not self.running:
-            self.running = True
-            self.start_button.config(text="Stop Simulation")
-            self.status_var.set("Status: Running")
-            
-            # Start simulation in a separate thread
-            self.simulation_thread = threading.Thread(target=self.run_simulation)
-            self.simulation_thread.daemon = True
-            self.simulation_thread.start()
+class SimpleQubit:
+    """Simplified qubit representation"""
+    def __init__(self, bit, basis):
+        self.bit = bit
+        self.basis = basis
+    
+    def measure(self, measurement_basis):
+        """Measure qubit in given basis"""
+        if measurement_basis == self.basis:
+            # Matching basis - correct result (with small error)
+            if np.random.random() > 0.01:  # 99% accurate
+                return self.bit
+            else:
+                return 1 - self.bit
         else:
-            self.running = False
-            self.start_button.config(text="Start Simulation")
-            self.status_var.set("Status: Stopped")
-            
-    def reset_simulation(self):
-        """Reset the simulation"""
-        self.running = False
-        self.start_button.config(text="Start Simulation")
-        self.status_var.set("Status: Ready")
-        self.frame_count = 0
-        self.authenticated = False
+            # Non-matching basis - random result
+            return np.random.randint(0, 2)
 
-        # Reset engine
-        self.engine.eve_active = False
-        self.eve_var.set(False)
-        self.engine.total_sent = 0
-        self.engine.total_detected = 0
-        self.engine.total_errors = 0
 
-        # Clear history
-        self.master_buffer.clear()
+# ==================== QTA Protocol Implementation ====================
 
-        # Update visualization
-        self.update_visualization()
+class QTAProtocol:
+    """Implements Quantum Temporal Authentication protocol"""
+    
+    def __init__(self, config: QTAConfig):
+        self.config = config
+        self.lock = Lock()
         
-    def toggle_eve(self):
-        """Toggle Eve's activity"""
-        self.eve_active = self.eve_var.get()
-        self.engine.eve_active = self.eve_active
-
-    def run_simulation(self):
-        """Run the QTA simulation"""
-        while self.running:
-            # Run one frame of the protocol
-            self.run_frame()
-            
-            # Update visualization
-            self.root.after(0, self.update_visualization)
-            
-            # Sleep for a short time to control simulation speed
-            time.sleep(0.5)
-            
-    def run_frame(self):
-        """Run one frame of the QTA protocol"""
-        # Get Data from engine
-        batch_data = self.engine.run_protocol_step(PULSES_PER_FRAME)
-
-        for d in batch_data:
-            err_val = 1.0 if d["error"] else 0.0
-            self.master_buffer.append({
-                "x": d["idx"],
-                "y_time": d["offset"],
-                "attack": d["attacked"],
-                "err": err_val,
-                "lost": False  # Not simulating loss here
-            })
-
-            self.frame_count = d["idx"]
-
-        # Determine authentication based on recent QBER
-        if len(self.master_buffer) > 1:
-            recent_errs = [p["err"] for p in self.master_buffer]
-            avg_qber = sum(recent_errs) / len(recent_errs)
-            self.authenticated = avg_qber < QBER_THRESHOLD
+        # Statistics
+        self.stats = {
+            'frames_completed': 0,
+            'total_qubits_sent': 0,
+            'total_qubits_received': 0,
+            'total_authenticated': 0,
+            'qber_history': deque(maxlen=100),
+            'delay_history': deque(maxlen=100),
+            'detection_rate_history': deque(maxlen=100),
+            'auth_history': deque(maxlen=100),
+            'eve_intercept_history': deque(maxlen=100)
+        }
+    
+    def alice_prepare_frame(self):
+        """Alice prepares a frame of qubits"""
+        frame_data = {
+            'qubits': [],
+            'bits': [],
+            'bases': [],
+            'send_times': []
+        }
         
-    def update_visualization(self):
-        """Update the visualization plots"""
-        if len(self.master_buffer) > 1:
-            # Sort data into buckets
-            xs_safe = [p["x"] for p in self.master_buffer if not p["attack"]]
-            ys_safe = [p["y_time"] for p in self.master_buffer if not p["attack"]]
+        for _ in range(self.config.qubits_per_frame):
+            bit = np.random.randint(0, 2)
+            basis = np.random.choice(self.config.bases)
+            qubit = SimpleQubit(bit, basis)
             
-            xs_att = [p["x"] for p in self.master_buffer if p["attack"]]
-            ys_att = [p["y_time"] for p in self.master_buffer if p["attack"]]
-
-            self.plot_safe.set_data(xs_safe, ys_safe)
-            self.plot_attack.set_data(xs_att, ys_att)
+            frame_data['qubits'].append(qubit)
+            frame_data['bits'].append(bit)
+            frame_data['bases'].append(basis)
+            frame_data['send_times'].append(time.time() * 1000)  # ms
+        
+        return frame_data
+    
+    def simulate_channel(self, qubits):
+        """Simulate quantum channel with loss"""
+        transmitted = []
+        for qubit in qubits:
+            # Channel loss
+            if np.random.random() > self.config.channel_loss_prob:
+                transmitted.append(qubit)
+            else:
+                transmitted.append(None)
+        return transmitted
+    
+    def eve_attack(self, qubits, alice_data):
+        """Simulate Eve's intercept-resend attack"""
+        intercepted_indices = []
+        
+        # Check if Eve is active RIGHT NOW (not cached value)
+        if not self.config.eve_active:
+            return qubits, intercepted_indices
+        
+        modified_qubits = []
+        for i, qubit in enumerate(qubits):
+            if qubit is None:
+                modified_qubits.append(None)
+                continue
             
-            last_x = self.master_buffer[-1]["x"]
-            self.timing_ax.set_xlim(max(0, last_x - self.master_buffer.maxlen), last_x + 10)
-
-            # QBER
-            qber_x = []
-            qber_y = []
-            recent_errs = deque(maxlen=20)
-            
-            for p in self.master_buffer:
-                recent_errs.append(p["err"])
-                avg = sum(recent_errs) / len(recent_errs)
-                qber_x.append(p["x"])
-                qber_y.append(avg)
-            
-            self.qber_line.set_data(qber_x, qber_y)
-            self.qber_ax.set_xlim(max(0, last_x - self.master_buffer.maxlen), last_x + 10)
-            
-            # Update quantum state visualization
-            self.quantum_ax.clear()
-            self.quantum_ax.set_title("Quantum State Visualization")
-            self.quantum_ax.set_xlabel("Pulse Index")
-            self.quantum_ax.set_ylabel("Basis/Value")
-            
-            # Show a sample of quantum states
-            sample_size = min(50, PULSES_PER_FRAME)
-            if sample_size > 0:
-                indices = random.sample(range(PULSES_PER_FRAME), sample_size)
+            # Eve intercepts with probability
+            if np.random.random() < self.config.eve_intercept_prob:
+                intercepted_indices.append(i)
                 
-                for i in indices:
-                    # Randomly generate a state for visualization
-                    basis = random.choice(["Z", "X"])
-                    value = random.randint(0, 1)
-                    
-                    # Plot as a scatter point with color based on basis and marker based on value
-                    color = 'blue' if basis == "Z" else 'red'
-                    marker = 'o' if value == 0 else '^'
-                    
-                    self.quantum_ax.scatter(i, 0, color=color, marker=marker, alpha=0.7)
-            
-            self.canvas.draw_idle()
-
-            ratio = self.engine.total_errors / self.engine.total_detected if self.engine.total_detected > 0 else 0
-            self.status_var.set(f"TOTAL SENT: {self.engine.total_sent}\nDETECTED: {self.engine.total_detected}\nAVG QBER: {ratio:.1%}")
-
-        # Update authentication status
-        self.auth_ax.clear()
-        self.auth_ax.set_title("Authentication Status")
-        self.auth_ax.axis('off')
-
-        status_text = f"Frame: {self.frame_count}\n"
-        status_text += f"Authentication: {'Success' if self.authenticated else 'Failed'}\n"
-        status_text += f"Eve Active: {'Yes' if self.eve_active else 'No'}\n"
-        status_text += f"Eve Active on Engine: {'Yes' if self.engine.eve_active else 'No'}\n"
-
-        if self.master_buffer:
-            recent_buffer = list(self.master_buffer)[-20:]
-            last_errs = [p["err"] for p in recent_buffer]
-            if last_errs:
-                current_qber = sum(last_errs) / len(last_errs)
-                status_text += f"Current QBER: {current_qber:.4f}\n"
-
-        self.auth_ax.text(0.1, 0.5, status_text, fontsize=12,
-                         verticalalignment='center', family='monospace')
+                # Eve measures in random basis
+                eve_basis = np.random.choice(self.config.bases)
+                eve_result = qubit.measure(eve_basis)
+                
+                # Eve resends new qubit
+                new_qubit = SimpleQubit(eve_result, eve_basis)
+                modified_qubits.append(new_qubit)
+            else:
+                modified_qubits.append(qubit)
         
-    def on_closing(self):
-        """Handle window closing event"""
+        return modified_qubits, intercepted_indices
+    
+    def bob_measure_frame(self, qubits, receive_times):
+        """Bob measures received qubits"""
+        measurements = {
+            'results': [],
+            'bases': [],
+            'receive_times': receive_times,
+            'measured_count': 0
+        }
+        
+        for qubit in qubits:
+            if qubit is not None:
+                # Detector efficiency
+                if np.random.random() < self.config.detector_efficiency:
+                    basis = np.random.choice(self.config.bases)
+                    result = qubit.measure(basis)
+                    measurements['results'].append(result)
+                    measurements['bases'].append(basis)
+                    measurements['measured_count'] += 1
+                else:
+                    measurements['results'].append(None)
+                    measurements['bases'].append(None)
+            else:
+                measurements['results'].append(None)
+                measurements['bases'].append(None)
+        
+        return measurements
+    
+    def verify_frame(self, alice_data, bob_data):
+        """Verify frame and make authentication decision"""
+        # 1. Calculate QBER on matching bases
+        matched_indices = []
+        errors = 0
+        
+        for i in range(len(alice_data['bases'])):
+            if i < len(bob_data['results']) and bob_data['results'][i] is not None:
+                if alice_data['bases'][i] == bob_data['bases'][i]:
+                    matched_indices.append(i)
+                    if alice_data['bits'][i] != bob_data['results'][i]:
+                        errors += 1
+        
+        qber = errors / len(matched_indices) if matched_indices else 1.0
+        
+        # 2. Calculate timing delays
+        delays = []
+        for i in range(min(len(alice_data['send_times']), len(bob_data['receive_times']))):
+            if bob_data['receive_times'][i] is not None:
+                delay = bob_data['receive_times'][i] - alice_data['send_times'][i]
+                delays.append(delay)
+        
+        avg_delay = np.mean(delays) if delays else float('inf')
+        
+        # 3. Calculate detection rate
+        detection_rate = bob_data['measured_count'] / self.config.qubits_per_frame
+        
+        # 4. Authentication decision
+        qber_ok = qber <= self.config.qber_threshold
+        timing_ok = abs(avg_delay - self.config.expected_delay_ms) <= self.config.timing_window_ms
+        detection_ok = detection_rate >= self.config.min_detection_rate
+        
+        authenticated = qber_ok and timing_ok and detection_ok
+        
+        # 5. Update statistics
+        with self.lock:
+            self.stats['frames_completed'] += 1
+            self.stats['total_qubits_sent'] += self.config.qubits_per_frame
+            self.stats['total_qubits_received'] += bob_data['measured_count']
+            if authenticated:
+                self.stats['total_authenticated'] += 1
+            
+            self.stats['qber_history'].append(qber)
+            self.stats['delay_history'].append(avg_delay)
+            self.stats['detection_rate_history'].append(detection_rate)
+            self.stats['auth_history'].append(1 if authenticated else 0)
+        
+        return {
+            'authenticated': authenticated,
+            'qber': qber,
+            'avg_delay': avg_delay,
+            'detection_rate': detection_rate,
+            'matched_count': len(matched_indices),
+            'qber_ok': qber_ok,
+            'timing_ok': timing_ok,
+            'detection_ok': detection_ok
+        }
+
+
+# ==================== Simulation Engine ====================
+
+class QTASimulation:
+    """Manages QTA simulation"""
+    
+    def __init__(self, config: QTAConfig, protocol: QTAProtocol, signals):
+        self.config = config
+        self.protocol = protocol
+        self.signals = signals
         self.running = False
-        self.engine.stop()
-        self.root.destroy()
+    
+    def run_frame(self):
+        """Execute one QTA frame"""
+        # Alice prepares frame
+        alice_data = self.protocol.alice_prepare_frame()
+        
+        # Channel transmission
+        transmitted_qubits = self.protocol.simulate_channel(alice_data['qubits'])
+        
+        # Eve attack simulation (checks config.eve_active inside)
+        qubits_after_eve, intercepted = self.protocol.eve_attack(transmitted_qubits, alice_data)
+        
+        # Eve's attack introduces delay ONLY IF EVE IS ACTIVE
+        if intercepted and self.config.eve_active:
+            time.sleep(self.config.eve_delay_ms / 1000.0)
+        
+        # Simulate transmission delay
+        time.sleep(self.config.expected_delay_ms / 1000.0)
+        
+        # Bob receives and measures
+        receive_times = [time.time() * 1000] * len(qubits_after_eve)
+        bob_data = self.protocol.bob_measure_frame(qubits_after_eve, receive_times)
+        
+        # Verification and authentication
+        result = self.protocol.verify_frame(alice_data, bob_data)
+        result['eve_intercepted'] = len(intercepted)
+        result['eve_active'] = self.config.eve_active  # Add current Eve status
+        
+        # Store Eve intercepts in stats
+        self.protocol.stats['eve_intercept_history'].append(len(intercepted))
+        
+        # Emit signal to update GUI
+        self.signals.frame_completed.emit(result)
+        
+        return result
+    
+    def run_simulation(self):
+        """Run complete simulation"""
+        self.running = True
+        
+        for frame_idx in range(self.config.num_frames):
+            if not self.running:
+                break
+            
+            self.run_frame()
+            time.sleep(self.config.frame_interval_ms / 1000.0)
+        
+        self.signals.simulation_completed.emit()
+    
+    def stop(self):
+        """Stop simulation"""
+        self.running = False
 
-# Main function
+
+# ==================== GUI Signals ====================
+
+class GUISignals(QObject):
+    """Qt signals for thread-safe GUI updates"""
+    frame_completed = pyqtSignal(dict)
+    simulation_completed = pyqtSignal()
+
+
+# ==================== Matplotlib Canvas Widgets ====================
+
+class QBERCanvas(FigureCanvas):
+    """Canvas for QBER plot"""
+    
+    def __init__(self, parent=None):
+        self.fig = Figure(figsize=(8, 3), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        super().__init__(self.fig)
+        self.setParent(parent)
+        
+        self.ax.set_xlabel('Frame')
+        self.ax.set_ylabel('QBER')
+        self.ax.set_title('Quantum Bit Error Rate')
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_ylim(0, 0.3)
+        
+    def update_plot(self, qber_history, auth_history, threshold):
+        self.ax.clear()
+        self.ax.set_xlabel('Frame')
+        self.ax.set_ylabel('QBER')
+        self.ax.set_title('Quantum Bit Error Rate')
+        self.ax.grid(True, alpha=0.3)
+        
+        if qber_history:
+            frames = list(range(len(qber_history)))
+            colors = ['green' if a else 'red' for a in auth_history]
+            
+            self.ax.scatter(frames, qber_history, c=colors, s=30, alpha=0.6)
+            self.ax.plot(frames, qber_history, alpha=0.3, color='blue')
+            self.ax.axhline(threshold, color='red', linestyle='--', 
+                           label=f'Threshold: {threshold}', alpha=0.7)
+            self.ax.legend()
+            self.ax.set_ylim(0, max(0.3, max(qber_history) * 1.2))
+        
+        self.draw()
+
+
+class TimingCanvas(FigureCanvas):
+    """Canvas for timing delay plot"""
+    
+    def __init__(self, parent=None):
+        self.fig = Figure(figsize=(8, 3), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        super().__init__(self.fig)
+        self.setParent(parent)
+        
+        self.ax.set_xlabel('Frame')
+        self.ax.set_ylabel('Delay (ms)')
+        self.ax.set_title('Detection Timing Delays')
+        self.ax.grid(True, alpha=0.3)
+        
+    def update_plot(self, delay_history, auth_history, expected, window):
+        self.ax.clear()
+        self.ax.set_xlabel('Frame')
+        self.ax.set_ylabel('Delay (ms)')
+        self.ax.set_title('Detection Timing Delays')
+        self.ax.grid(True, alpha=0.3)
+        
+        if delay_history:
+            frames = list(range(len(delay_history)))
+            colors = ['green' if a else 'red' for a in auth_history]
+            
+            self.ax.scatter(frames, delay_history, c=colors, s=30, alpha=0.6)
+            self.ax.plot(frames, delay_history, alpha=0.3, color='blue')
+            
+            self.ax.axhline(expected, color='gray', linestyle='-', 
+                           label='Expected', alpha=0.5)
+            self.ax.axhline(expected + window, color='red', linestyle='--', 
+                           label=f'Window: ±{window} ms', alpha=0.7)
+            self.ax.axhline(expected - window, color='red', linestyle='--', alpha=0.7)
+            
+            self.ax.legend()
+        
+        self.draw()
+
+
+class DetectionCanvas(FigureCanvas):
+    """Canvas for detection rate plot"""
+    
+    def __init__(self, parent=None):
+        self.fig = Figure(figsize=(8, 3), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        super().__init__(self.fig)
+        self.setParent(parent)
+        
+        self.ax.set_xlabel('Frame')
+        self.ax.set_ylabel('Detection Rate')
+        self.ax.set_title('Qubit Detection Rate')
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_ylim(0, 1.1)
+        
+    def update_plot(self, detection_history, auth_history, threshold):
+        self.ax.clear()
+        self.ax.set_xlabel('Frame')
+        self.ax.set_ylabel('Detection Rate')
+        self.ax.set_title('Qubit Detection Rate')
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_ylim(0, 1.1)
+        
+        if detection_history:
+            frames = list(range(len(detection_history)))
+            colors = ['green' if a else 'red' for a in auth_history]
+            
+            self.ax.scatter(frames, detection_history, c=colors, s=30, alpha=0.6)
+            self.ax.plot(frames, detection_history, alpha=0.3, color='blue')
+            self.ax.axhline(threshold, color='red', linestyle='--', 
+                           label=f'Min: {threshold}', alpha=0.7)
+            self.ax.legend()
+        
+        self.draw()
+
+
+# ==================== Main GUI Window ====================
+
+class QTASimulatorGUI(QMainWindow):
+    """Main GUI window for QTA simulator"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        self.config = QTAConfig()
+        self.protocol = QTAProtocol(self.config)
+        self.signals = GUISignals()
+        self.simulation = None
+        self.simulation_thread = None
+        
+        # Connect signals
+        self.signals.frame_completed.connect(self.on_frame_completed)
+        self.signals.simulation_completed.connect(self.on_simulation_completed)
+        
+        self.init_ui()
+        
+    def init_ui(self):
+        """Initialize user interface"""
+        self.setWindowTitle('Quantum Temporal Authentication (QTA) Simulator')
+        self.setGeometry(100, 100, 1400, 900)
+        
+        # Apply dark theme
+        self.apply_dark_theme()
+        
+        # Central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+        
+        # Left panel - Controls
+        left_panel = self.create_control_panel()
+        main_layout.addWidget(left_panel, 1)
+        
+        # Right panel - Visualizations
+        right_panel = self.create_visualization_panel()
+        main_layout.addWidget(right_panel, 3)
+        
+    def apply_dark_theme(self):
+        """Apply dark color theme"""
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor(53, 53, 53))
+        palette.setColor(QPalette.WindowText, Qt.white)
+        palette.setColor(QPalette.Base, QColor(25, 25, 25))
+        palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+        palette.setColor(QPalette.ToolTipBase, Qt.white)
+        palette.setColor(QPalette.ToolTipText, Qt.white)
+        palette.setColor(QPalette.Text, Qt.white)
+        palette.setColor(QPalette.Button, QColor(53, 53, 53))
+        palette.setColor(QPalette.ButtonText, Qt.white)
+        palette.setColor(QPalette.BrightText, Qt.red)
+        palette.setColor(QPalette.Link, QColor(42, 130, 218))
+        palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+        palette.setColor(QPalette.HighlightedText, Qt.black)
+        self.setPalette(palette)
+        
+    def create_control_panel(self):
+        """Create left control panel"""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        
+        # Title
+        title = QLabel('QTA Simulator Control')
+        title.setFont(QFont('Arial', 16, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Configuration group
+        config_group = QGroupBox('Simulation Parameters')
+        config_layout = QGridLayout()
+        
+        row = 0
+        
+        # Number of frames
+        config_layout.addWidget(QLabel('Frames:'), row, 0)
+        self.frames_spin = QSpinBox()
+        self.frames_spin.setRange(10, 1000)
+        self.frames_spin.setValue(self.config.num_frames)
+        config_layout.addWidget(self.frames_spin, row, 1)
+        row += 1
+        
+        # Qubits per frame
+        config_layout.addWidget(QLabel('Qubits/Frame:'), row, 0)
+        self.qubits_spin = QSpinBox()
+        self.qubits_spin.setRange(5, 100)
+        self.qubits_spin.setValue(self.config.qubits_per_frame)
+        config_layout.addWidget(self.qubits_spin, row, 1)
+        row += 1
+        
+        # Frame interval
+        config_layout.addWidget(QLabel('Frame Interval (ms):'), row, 0)
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(10, 1000)
+        self.interval_spin.setValue(self.config.frame_interval_ms)
+        config_layout.addWidget(self.interval_spin, row, 1)
+        row += 1
+        
+        # QBER threshold
+        config_layout.addWidget(QLabel('QBER Threshold:'), row, 0)
+        self.qber_spin = QDoubleSpinBox()
+        self.qber_spin.setRange(0.01, 0.5)
+        self.qber_spin.setSingleStep(0.01)
+        self.qber_spin.setValue(self.config.qber_threshold)
+        config_layout.addWidget(self.qber_spin, row, 1)
+        row += 1
+        
+        # Timing window
+        config_layout.addWidget(QLabel('Timing Window (ms):'), row, 0)
+        self.timing_spin = QDoubleSpinBox()
+        self.timing_spin.setRange(1.0, 100.0)
+        self.timing_spin.setValue(self.config.timing_window_ms)
+        config_layout.addWidget(self.timing_spin, row, 1)
+        row += 1
+        
+        config_group.setLayout(config_layout)
+        layout.addWidget(config_group)
+        
+        # Eve configuration
+        eve_group = QGroupBox('Attacker (Eve) Configuration')
+        eve_layout = QGridLayout()
+        
+        self.eve_checkbox = QCheckBox('Enable Eve Attack')
+        self.eve_checkbox.setChecked(self.config.eve_active)
+        # Connect checkbox to live update - THIS IS THE KEY FIX
+        self.eve_checkbox.stateChanged.connect(self.on_eve_checkbox_changed)
+        eve_layout.addWidget(self.eve_checkbox, 0, 0, 1, 2)
+        
+        # Eve status indicator
+        self.eve_status_label = QLabel('Status: ACTIVE' if self.config.eve_active else 'Status: INACTIVE')
+        self.eve_status_label.setFont(QFont('Arial', 10, QFont.Bold))
+        self.eve_status_label.setStyleSheet('color: red;' if self.config.eve_active else 'color: green;')
+        eve_layout.addWidget(self.eve_status_label, 1, 0, 1, 2)
+        
+        eve_layout.addWidget(QLabel('Intercept Probability:'), 2, 0)
+        self.eve_prob_spin = QDoubleSpinBox()
+        self.eve_prob_spin.setRange(0.0, 1.0)
+        self.eve_prob_spin.setSingleStep(0.1)
+        self.eve_prob_spin.setValue(self.config.eve_intercept_prob)
+        self.eve_prob_spin.valueChanged.connect(self.on_eve_prob_changed)
+        eve_layout.addWidget(self.eve_prob_spin, 2, 1)
+        
+        eve_layout.addWidget(QLabel('Eve Delay (ms):'), 3, 0)
+        self.eve_delay_spin = QDoubleSpinBox()
+        self.eve_delay_spin.setRange(0.0, 100.0)
+        self.eve_delay_spin.setValue(self.config.eve_delay_ms)
+        self.eve_delay_spin.valueChanged.connect(self.on_eve_delay_changed)
+        eve_layout.addWidget(self.eve_delay_spin, 3, 1)
+        
+        eve_group.setLayout(eve_layout)
+        layout.addWidget(eve_group)
+        
+        # Control buttons
+        button_layout = QVBoxLayout()
+        
+        self.start_btn = QPushButton('Start Simulation')
+        self.start_btn.setFont(QFont('Arial', 12, QFont.Bold))
+        self.start_btn.clicked.connect(self.start_simulation)
+        button_layout.addWidget(self.start_btn)
+        
+        self.stop_btn = QPushButton('Stop Simulation')
+        self.stop_btn.setFont(QFont('Arial', 12, QFont.Bold))
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_simulation)
+        button_layout.addWidget(self.stop_btn)
+        
+        self.reset_btn = QPushButton('Reset')
+        self.reset_btn.clicked.connect(self.reset_simulation)
+        button_layout.addWidget(self.reset_btn)
+        
+        layout.addLayout(button_layout)
+        
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        layout.addWidget(self.progress_bar)
+        
+        # Statistics display
+        stats_group = QGroupBox('Real-Time Statistics')
+        stats_layout = QVBoxLayout()
+        
+        self.stats_text = QTextEdit()
+        self.stats_text.setReadOnly(True)
+        self.stats_text.setMaximumHeight(200)
+        stats_layout.addWidget(self.stats_text)
+        
+        stats_group.setLayout(stats_layout)
+        layout.addWidget(stats_group)
+        
+        layout.addStretch()
+        
+        return panel
+    
+    def on_eve_checkbox_changed(self, state):
+        """Handle Eve checkbox state change - LIVE UPDATE"""
+        self.config.eve_active = (state == Qt.Checked)
+        status_text = 'Status: ACTIVE' if self.config.eve_active else 'Status: INACTIVE'
+        status_color = 'color: red;' if self.config.eve_active else 'color: green;'
+        self.eve_status_label.setText(status_text)
+        self.eve_status_label.setStyleSheet(status_color)
+        print(f"Eve attack {'ENABLED' if self.config.eve_active else 'DISABLED'}")
+    
+    def on_eve_prob_changed(self, value):
+        """Handle Eve intercept probability change"""
+        self.config.eve_intercept_prob = value
+    
+    def on_eve_delay_changed(self, value):
+        """Handle Eve delay change"""
+        self.config.eve_delay_ms = value
+    
+    def create_visualization_panel(self):
+        """Create right visualization panel"""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        
+        # Tab widget for different visualizations
+        tabs = QTabWidget()
+        
+        # QBER tab
+        qber_tab = QWidget()
+        qber_layout = QVBoxLayout(qber_tab)
+        self.qber_canvas = QBERCanvas()
+        qber_layout.addWidget(self.qber_canvas)
+        tabs.addTab(qber_tab, 'QBER Analysis')
+        
+        # Timing tab
+        timing_tab = QWidget()
+        timing_layout = QVBoxLayout(timing_tab)
+        self.timing_canvas = TimingCanvas()
+        timing_layout.addWidget(self.timing_canvas)
+        tabs.addTab(timing_tab, 'Timing Analysis')
+        
+        # Detection tab
+        detection_tab = QWidget()
+        detection_layout = QVBoxLayout(detection_tab)
+        self.detection_canvas = DetectionCanvas()
+        detection_layout.addWidget(self.detection_canvas)
+        tabs.addTab(detection_tab, 'Detection Rate')
+        
+        layout.addWidget(tabs)
+        
+        # Status display
+        status_group = QGroupBox('Current Frame Status')
+        status_layout = QGridLayout()
+        
+        self.frame_label = QLabel('Frame: 0')
+        self.frame_label.setFont(QFont('Arial', 12))
+        status_layout.addWidget(self.frame_label, 0, 0)
+        
+        self.auth_label = QLabel('Status: Ready')
+        self.auth_label.setFont(QFont('Arial', 12, QFont.Bold))
+        status_layout.addWidget(self.auth_label, 0, 1)
+        
+        self.qber_label = QLabel('QBER: -')
+        status_layout.addWidget(self.qber_label, 1, 0)
+        
+        self.delay_label = QLabel('Delay: -')
+        status_layout.addWidget(self.delay_label, 1, 1)
+        
+        self.detection_label = QLabel('Detection: -')
+        status_layout.addWidget(self.detection_label, 2, 0)
+        
+        self.eve_label = QLabel('Eve Intercepts: -')
+        status_layout.addWidget(self.eve_label, 2, 1)
+        
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+        
+        return panel
+    
+    def update_config_from_gui(self):
+        """Update configuration from GUI inputs"""
+        self.config.num_frames = self.frames_spin.value()
+        self.config.qubits_per_frame = self.qubits_spin.value()
+        self.config.frame_interval_ms = self.interval_spin.value()
+        self.config.qber_threshold = self.qber_spin.value()
+        self.config.timing_window_ms = self.timing_spin.value()
+        # Eve config is updated live, no need to set here
+    
+    def start_simulation(self):
+        """Start simulation in background thread"""
+        self.update_config_from_gui()
+        
+        # Reset protocol
+        self.protocol = QTAProtocol(self.config)
+        
+        # Create simulation
+        self.simulation = QTASimulation(self.config, self.protocol, self.signals)
+        
+        # Start simulation thread
+        self.simulation_thread = Thread(target=self.simulation.run_simulation)
+        self.simulation_thread.daemon = True
+        self.simulation_thread.start()
+        
+        # Update UI
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.auth_label.setText('Status: Running...')
+        self.auth_label.setStyleSheet('color: yellow;')
+        self.progress_bar.setMaximum(self.config.num_frames)
+        self.progress_bar.setValue(0)
+        
+    def stop_simulation(self):
+        """Stop running simulation"""
+        if self.simulation:
+            self.simulation.stop()
+        
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.auth_label.setText('Status: Stopped')
+        self.auth_label.setStyleSheet('color: orange;')
+    
+    def reset_simulation(self):
+        """Reset simulation and clear data"""
+        self.stop_simulation()
+        
+        self.protocol = QTAProtocol(self.config)
+        self.progress_bar.setValue(0)
+        self.frame_label.setText('Frame: 0')
+        self.auth_label.setText('Status: Ready')
+        self.auth_label.setStyleSheet('')
+        self.qber_label.setText('QBER: -')
+        self.delay_label.setText('Delay: -')
+        self.detection_label.setText('Detection: -')
+        self.eve_label.setText('Eve Intercepts: -')
+        self.stats_text.clear()
+        
+        # Clear plots
+        self.qber_canvas.update_plot([], [], self.config.qber_threshold)
+        self.timing_canvas.update_plot([], [], self.config.expected_delay_ms, 
+                                      self.config.timing_window_ms)
+        self.detection_canvas.update_plot([], [], self.config.min_detection_rate)
+    
+    def on_frame_completed(self, result):
+        """Handle frame completion event"""
+        frame = self.protocol.stats['frames_completed']
+        
+        # Update progress
+        self.progress_bar.setValue(frame)
+        self.frame_label.setText(f'Frame: {frame}')
+        
+        # Update status labels
+        if result['authenticated']:
+            self.auth_label.setText('Status: [AUTHENTICATED]')
+            self.auth_label.setStyleSheet('color: green; font-weight: bold;')
+        else:
+            self.auth_label.setText('Status: [REJECTED]')
+            self.auth_label.setStyleSheet('color: red; font-weight: bold;')
+        
+        check_ok = '[OK]' if result['qber_ok'] else '[FAIL]'
+        self.qber_label.setText(f"QBER: {result['qber']:.4f} {check_ok}")
+        
+        check_timing = '[OK]' if result['timing_ok'] else '[FAIL]'
+        self.delay_label.setText(f"Delay: {result['avg_delay']:.2f} ms {check_timing}")
+        
+        check_det = '[OK]' if result['detection_ok'] else '[FAIL]'
+        self.detection_label.setText(f"Detection: {result['detection_rate']:.2%} {check_det}")
+        
+        # Show Eve status in intercepts label
+        eve_status = "ACTIVE" if result.get('eve_active', False) else "INACTIVE"
+        self.eve_label.setText(f"Eve: {eve_status} | Intercepts: {result.get('eve_intercepted', 0)}")
+        
+        # Update statistics text
+        stats = self.protocol.stats
+        success_rate = stats['total_authenticated'] / stats['frames_completed'] * 100 if stats['frames_completed'] > 0 else 0
+        
+        eve_indicator = "[ACTIVE]" if self.config.eve_active else "[INACTIVE]"
+        
+        stats_text = f"""
+=== CUMULATIVE STATISTICS ===
+Frames Completed: {stats['frames_completed']}/{self.config.num_frames}
+Authentication Success Rate: {success_rate:.1f}%
+
+Eve Status: {eve_indicator}
+
+Qubits Sent: {stats['total_qubits_sent']}
+Qubits Received: {stats['total_qubits_received']}
+Detection Rate: {stats['total_qubits_received']/max(1, stats['total_qubits_sent'])*100:.1f}%
+
+Average QBER: {np.mean(stats['qber_history']):.4f}
+Average Delay: {np.mean(stats['delay_history']):.2f} ms
+
+Current Frame Details:
+- Matched Bases: {result['matched_count']}
+- QBER: {result['qber']:.4f} (Threshold: {self.config.qber_threshold})
+- Delay: {result['avg_delay']:.2f} ms (Window: +/-{self.config.timing_window_ms} ms)
+- Detection: {result['detection_rate']:.2%} (Min: {self.config.min_detection_rate:.0%})
+- Eve Intercepts This Frame: {result.get('eve_intercepted', 0)}
+"""
+        self.stats_text.setText(stats_text)
+        
+        # Update plots
+        self.qber_canvas.update_plot(
+            list(self.protocol.stats['qber_history']),
+            list(self.protocol.stats['auth_history']),
+            self.config.qber_threshold
+        )
+        
+        self.timing_canvas.update_plot(
+            list(self.protocol.stats['delay_history']),
+            list(self.protocol.stats['auth_history']),
+            self.config.expected_delay_ms,
+            self.config.timing_window_ms
+        )
+        
+        self.detection_canvas.update_plot(
+            list(self.protocol.stats['detection_rate_history']),
+            list(self.protocol.stats['auth_history']),
+            self.config.min_detection_rate
+        )
+    
+    def on_simulation_completed(self):
+        """Handle simulation completion"""
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.auth_label.setText('Status: Completed')
+        self.auth_label.setStyleSheet('color: cyan; font-weight: bold;')
+        
+        # Show final summary
+        stats = self.protocol.stats
+        success_rate = stats['total_authenticated'] / stats['frames_completed'] * 100 if stats['frames_completed'] > 0 else 0
+        
+        summary = f"""
+========================================
+   SIMULATION COMPLETED SUCCESSFULLY    
+========================================
+
+Final Results:
+----------------------------------------
+Frames Simulated: {stats['frames_completed']}
+Authentication Success Rate: {success_rate:.1f}%
+Successful Authentications: {stats['total_authenticated']}/{stats['frames_completed']}
+
+Quantum Channel Statistics:
+----------------------------------------
+Total Qubits Transmitted: {stats['total_qubits_sent']}
+Total Qubits Detected: {stats['total_qubits_received']}
+Overall Detection Rate: {stats['total_qubits_received']/max(1, stats['total_qubits_sent'])*100:.1f}%
+
+Security Metrics:
+----------------------------------------
+Average QBER: {np.mean(stats['qber_history']):.4f}
+QBER Threshold: {self.config.qber_threshold}
+QBER Violation Rate: {sum(1 for q in stats['qber_history'] if q > self.config.qber_threshold)/max(1, len(stats['qber_history']))*100:.1f}%
+
+Timing Analysis:
+----------------------------------------
+Average Delay: {np.mean(stats['delay_history']):.2f} ms
+Expected Delay: {self.config.expected_delay_ms} ms
+Timing Window: +/-{self.config.timing_window_ms} ms
+
+Eve Attack Analysis:
+----------------------------------------
+Eve Active: {'Yes' if self.config.eve_active else 'No'}
+Total Intercepts: {sum(stats['eve_intercept_history'])}
+Avg Intercepts/Frame: {np.mean(stats['eve_intercept_history']):.1f}
+Attack Detection: {'Successful - Low Auth Rate' if success_rate < 80 else 'Partial - Some Frames Rejected'}
+"""
+        
+        self.stats_text.setText(summary)
+
+
+# ==================== Main Entry Point ====================
+
 def main():
-    root = tk.Tk()
-    app = QTASimulator(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
+    """Main entry point"""
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')  # Modern look
+    
+    window = QTASimulatorGUI()
+    window.show()
+    
+    sys.exit(app.exec_())
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
+
+    
