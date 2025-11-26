@@ -99,6 +99,44 @@ A typical QTA session follows a structured four-stage process:
 
 4. **Server Verification**: The Server verifies the authenticity of the response and checks it for correctness. It compares the client's measurement outcomes with the expected values, confirms that detections fell within the |ToA_i − t_i| ≤ Δt window, and calculates the QBER. If all metrics are within predefined thresholds, authentication is successful.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Server (Alice)
+    participant QC as Quantum Channel
+    participant C as Client (Bob)
+    participant CC as Classical Channel
+
+    Note over S,C: Phase 1: Setup
+    S->>CC: Session params {epoch, Δt, N_s, frame_params}
+    CC->>C: Parameters delivered
+    C->>CC: ACK {client_id, ready}
+    CC->>S: ACK received
+
+    Note over S,C: Phase 2: Quantum Challenge
+    loop For each qubit i in frame
+        S->>S: Generate bit b_i, basis B_i
+        S->>QC: Emit |ψ_i⟩ at t_i
+        QC->>C: Quantum state arrives (if not lost)
+        C->>C: Measure in random basis B'_i
+    end
+
+    Note over S,C: Phase 3: Client Response
+    C->>C: Compile {measurements, ToA_list, HMAC}
+    C->>CC: Response sent
+    CC->>S: Response received
+
+    Note over S,C: Phase 4: Server Verification
+    S->>S: Verify HMAC, sift bases, calculate QBER, check timing
+    S->>S: Decision: ACCEPT or REJECT
+
+    alt ACCEPT
+        S->>C: Authentication SUCCESS
+    else REJECT
+        S->>C: Authentication FAILED
+    end
+```
+
 ### Protocol Parameters and Variants
 
 The protocol's performance and security can be tuned using various parameters.
