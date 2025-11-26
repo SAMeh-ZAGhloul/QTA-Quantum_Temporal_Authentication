@@ -10,7 +10,7 @@ The security of QTA is derived from two core concepts: **Temporal Binding**, whe
 
 This document outlines a comprehensive framework for QTA, detailing its protocol specification, operational flow, and security advantages. Key applications include high-assurance identity verification for critical infrastructure, satellite-to-ground communications, and augmenting quantum-resistant Public Key Infrastructure (PKI). Furthermore, a detailed risk and threat model is presented, alongside a practical plan for operational monitoring using the Zeek network analysis framework to integrate QTA events into Security Information and Event Management (SIEM) and Cybersecurity Bill of Materials (CBOM) systems.
 
-## Demo Video
+## QTA Overview Video
 
 [📹 Watch QTA Overview Video](QTA-Quantum_Temporal_Authentication.mp4)
 
